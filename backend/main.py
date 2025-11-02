@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 from dotenv import load_dotenv
-import googlemaps
+import requests
 from scipy.spatial.distance import cdist
 import numpy as np
 
@@ -14,7 +14,7 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI(
     title="Route Optimization API",
-    description="Backend for optimizing delivery routes",
+    description="Backend for optimizing delivery routes using HERE Platform",
     version="1.0.0"
 )
 
@@ -27,9 +27,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Google Maps client
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY) if GOOGLE_MAPS_API_KEY else None
+# HERE Platform API configuration
+HERE_API_KEY = os.getenv("HERE_API_KEY", "")
+HERE_GEOCODE_URL = "https://geocode.search.hereapi.com/v1/geocode"
+HERE_ROUTE_URL = "https://router.hereapi.com/v8/routes"
 
 # Pydantic models for request/response
 class Order(BaseModel):
@@ -64,30 +65,41 @@ class OptimizeRouteResponse(BaseModel):
 def health_check():
     return {
         "status": "healthy",
-        "service": "Route Optimization API",
+        "service": "Route Optimization API (HERE Platform)",
         "version": "1.0.0",
-        "google_maps_configured": gmaps is not None
+        "here_api_configured": bool(HERE_API_KEY)
     }
 
 @app.get("/api/health")
 def api_health():
     return health_check()
 
-# Helper function: Geocode address to lat/lng
+# Helper function: Geocode address using HERE API
 def geocode_address(address: str) -> tuple:
-    """Convert address to (lat, lng) coordinates"""
-    if not gmaps:
+    """Convert address to (lat, lng) coordinates using HERE Geocoding API"""
+    if not HERE_API_KEY:
         # Fallback to dummy coordinates if no API key
-        # In real scenario, this would fail
+        print("Warning: No HERE API key, using dummy coordinates")
         return (52.3676, 4.9041)  # Amsterdam
     
     try:
-        result = gmaps.geocode(address)
-        if result:
-            location = result[0]['geometry']['location']
-            return (location['lat'], location['lng'])
+        params = {
+            'q': address,
+            'apiKey': HERE_API_KEY,
+            'limit': 1
+        }
+        
+        response = requests.get(HERE_GEOCODE_URL, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get('items'):
+            position = data['items'][0]['position']
+            return (position['lat'], position['lng'])
         else:
             raise ValueError(f"Could not geocode address: {address}")
+            
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Geocoding error: {str(e)}")
 
@@ -95,7 +107,7 @@ def geocode_address(address: str) -> tuple:
 def calculate_distance_matrix(coordinates: List[tuple]) -> np.ndarray:
     """Calculate distance matrix between all coordinate pairs"""
     # Use Euclidean distance as approximation
-    # In production, use Google Distance Matrix API for real road distances
+    # In production, could use HERE Matrix Routing API for real road distances
     coords_array = np.array(coordinates)
     distances = cdist(coords_array, coords_array, metric='euclidean')
     
@@ -109,6 +121,8 @@ def solve_tsp_with_priority(distance_matrix: np.ndarray, priorities: List[int], 
     """
     Solve Traveling Salesman Problem with priority consideration
     Uses nearest neighbor heuristic with priority weighting
+    
+    Lower priority number = higher importance (1 = highest priority)
     """
     n = len(distance_matrix)
     unvisited = set(range(n))
@@ -124,12 +138,12 @@ def solve_tsp_with_priority(distance_matrix: np.ndarray, priorities: List[int], 
             distance = distance_matrix[current][node]
             priority_weight = priorities[node]
             
-            # Lower distance = better, Higher priority = better
-            # Priority 1 = highest, so invert: 1/priority
-            score = distance * priority_weight  # Lower score = better
+            # Priority 1 = highest (should visit first)
+            # So multiply distance by priority: higher priority (lower number) = lower score
+            score = distance * priority_weight
             scores.append((score, node))
         
-        # Pick node with lowest score
+        # Pick node with lowest score (closest + highest priority)
         scores.sort()
         next_node = scores[0][1]
         
@@ -144,7 +158,7 @@ def solve_tsp_with_priority(distance_matrix: np.ndarray, priorities: List[int], 
 def optimize_route(request: OptimizeRouteRequest):
     """
     Optimize delivery route based on:
-    - Addresses (geocoded to coordinates)
+    - Addresses (geocoded to coordinates using HERE)
     - Priorities (1 = highest)
     - Distances between locations
     """
@@ -155,8 +169,11 @@ def optimize_route(request: OptimizeRouteRequest):
     if not orders:
         raise HTTPException(status_code=400, detail="No orders provided")
     
+    if not HERE_API_KEY:
+        raise HTTPException(status_code=500, detail="HERE API key not configured")
+    
     # Step 1: Geocode all addresses
-    print(f"Geocoding {len(orders)} addresses...")
+    print(f"Geocoding {len(orders)} addresses using HERE API...")
     addresses = [start_address] + [order.address for order in orders]
     
     try:
@@ -169,7 +186,7 @@ def optimize_route(request: OptimizeRouteRequest):
     distance_matrix = calculate_distance_matrix(coordinates)
     
     # Step 3: Solve TSP with priorities
-    print("Optimizing route...")
+    print("Optimizing route with priority weighting...")
     priorities = [1] + [order.priority for order in orders]  # Start has priority 1
     route_indices = solve_tsp_with_priority(distance_matrix, priorities, start_index=0)
     
@@ -221,7 +238,10 @@ def optimize_route(request: OptimizeRouteRequest):
 # Additional endpoint: Just geocode addresses (for testing)
 @app.post("/api/geocode")
 def geocode_addresses(addresses: List[str]):
-    """Geocode a list of addresses"""
+    """Geocode a list of addresses using HERE API"""
+    if not HERE_API_KEY:
+        raise HTTPException(status_code=500, detail="HERE API key not configured")
+    
     try:
         results = []
         for addr in addresses:
